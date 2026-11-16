@@ -1,0 +1,237 @@
+"""
+pc_check.py - Windows PC check scanner for known exploit/executor names.
+Run as Administrator (needed for Prefetch, BAM, and reading other processes' memory).
+Only run it on a PC you own or whose owner has agreed to the check.
+
+Usage:
+    python pc_check.py                  # standard scan (Roblox memory only)
+    python pc_check.py --all-procs      # scan memory of every process (slow)
+    python pc_check.py --deep           # also walk the root of every drive
+    python pc_check.py --weak-mem       # also search memory for the noisy words
+"""
+import os, re, sys, ctypes, codecs, argparse, datetime, string, subprocess
+from ctypes import wintypes
+try:
+    import psutil
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "psutil"])
+    import psutil
+import winreg
+
+# Distinctive names: matched as substrings
+STRONG = ["xeno", "matcha", "severe", "cosmic", "crime.cc", "crimecc",
+          "serotonin", "photon", "solara"]
+# Short or common words: only match when they stand alone (not inside other words)
+WEAK = ["dx9", "real", "drift", "cleaner", "universal"]
+
+STRONG_RE = re.compile("|".join(re.escape(k) for k in STRONG), re.I)
+WEAK_RE = re.compile(r"(?<![a-z0-9])(" + "|".join(WEAK) + r")(?![a-z0-9])", re.I)
+
+findings = []  # (severity, category, detail)
+
+def add(sev, cat, detail):
+    findings.append((sev, cat, detail))
+    print(f"[{sev}] {cat}: {detail}")
+
+def check_text(text, cat, detail_prefix=""):
+    m = STRONG_RE.search(text)
+    if m:
+        add("HIGH", cat, f"{detail_prefix}{text}  (matched '{m.group(0)}')")
+        return True
+    m = WEAK_RE.search(text)
+    if m:
+        add("LOW", cat, f"{detail_prefix}{text}  (matched '{m.group(0)}')")
+        return True
+    return False
+
+# ---------------------------------------------------------------- processes
+def scan_processes():
+    print("\n=== Running processes & loaded modules ===")
+    for p in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        try:
+            info = p.info
+            blob = " ".join(filter(None, [info["name"], info["exe"], " ".join(info["cmdline"] or [])]))
+            check_text(blob, "PROCESS", f"PID {info['pid']}: ")
+            if info["name"] and "roblox" in info["name"].lower():
+                for mm in p.memory_maps():
+                    check_text(mm.path, "LOADED MODULE", f"{info['name']} ({info['pid']}): ")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+# -------------------------------------------------------------------- files
+def scan_files(deep):
+    print("\n=== Files & folders ===")
+    home = os.path.expanduser("~")
+    roots = [
+        os.path.join(home, d) for d in
+        ["Downloads", "Desktop", "Documents", "AppData\\Local", "AppData\\Roaming",
+         "AppData\\Local\\Temp", "AppData\\Local\\Roblox", "AppData\\Roaming\\Microsoft\\Windows\\Recent"]
+    ] + [os.environ.get("ProgramData", "C:\\ProgramData"),
+         "C:\\Windows\\Prefetch", "C:\\Windows\\Temp"]
+    if deep:
+        roots += [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+    skip = ("\\windows\\winsxs", "\\windows\\system32", "\\windows\\syswow64",
+            "\\$recycle.bin", "\\microsoft\\edge", "\\google\\chrome\\user data\\default\\cache")
+    seen = set()
+    for root in roots:
+        if not os.path.exists(root):
+            continue
+        for dp, dn, fn in os.walk(root, onerror=lambda e: None):
+            if any(s in dp.lower() for s in skip):
+                dn[:] = []
+                continue
+            for name in dn + fn:
+                full = os.path.join(dp, name)
+                if full in seen:
+                    continue
+                seen.add(full)
+                check_text(name, "FILE", f"{dp}\\")
+
+# ----------------------------------------------------------------- registry
+def scan_registry():
+    print("\n=== Registry execution history ===")
+    def walk_values(hive, path, cat, decode=None):
+        try:
+            key = winreg.OpenKey(hive, path)
+        except OSError:
+            return
+        i = 0
+        while True:
+            try:
+                name, _, _ = winreg.EnumValue(key, i)
+            except OSError:
+                break
+            i += 1
+            check_text(decode(name) if decode else name, cat)
+        j = 0
+        while True:  # subkeys (UserAssist has GUID subkeys with \Count)
+            try:
+                sub = winreg.EnumKey(key, j)
+            except OSError:
+                break
+            j += 1
+            walk_values(hive, path + "\\" + sub, cat, decode)
+
+    rot13 = lambda s: codecs.decode(s, "rot_13")
+    walk_values(winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist", "USERASSIST", rot13)
+    walk_values(winreg.HKEY_CURRENT_USER,
+                r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache", "MUICACHE")
+    walk_values(winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store", "APPCOMPAT")
+    walk_values(winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Services\bam\State\UserSettings", "BAM")
+
+# ------------------------------------------------------------------- memory
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+class MBI(ctypes.Structure):
+    _fields_ = [("BaseAddress", ctypes.c_void_p), ("AllocationBase", ctypes.c_void_p),
+                ("AllocationProtect", wintypes.DWORD), ("PartitionId", wintypes.WORD),
+                ("RegionSize", ctypes.c_size_t), ("State", wintypes.DWORD),
+                ("Protect", wintypes.DWORD), ("Type", wintypes.DWORD)]
+k32.OpenProcess.restype = wintypes.HANDLE
+k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+k32.VirtualQueryEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(MBI), ctypes.c_size_t]
+k32.VirtualQueryEx.restype = ctypes.c_size_t
+k32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                  ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+PROCESS_QUERY_INFORMATION, PROCESS_VM_READ = 0x0400, 0x0010
+MEM_COMMIT, PAGE_NOACCESS, PAGE_GUARD = 0x1000, 0x01, 0x100
+CHUNK = 4 * 1024 * 1024
+
+def build_mem_patterns(include_weak):
+    def variants(kw, bounded):
+        a = re.escape(kw.encode())
+        u = b"\x00".join(re.escape(bytes([c])) for c in kw.encode()) + b"\x00"
+        if bounded:
+            a = b"(?<![A-Za-z0-9])" + a + b"(?![A-Za-z0-9])"
+            u = b"(?<![A-Za-z0-9]\x00)" + u + b"(?![A-Za-z0-9]\x00)"
+        return [a, u]
+    pats = []
+    for k in STRONG:
+        pats += variants(k, False)
+    if include_weak:
+        for k in WEAK:
+            pats += variants(k, True)
+    return re.compile(b"|".join(pats), re.I)
+
+def printable(b):
+    s = b.replace(b"\x00", b"").decode("ascii", "ignore")
+    return "".join(c if c in string.printable and c not in "\r\n\t" else "." for c in s)
+
+def scan_process_memory(pid, name, pattern):
+    h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not h:
+        return
+    hits = {}
+    addr, mbi = 0, MBI()
+    try:
+        while k32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            base, size = mbi.BaseAddress or 0, mbi.RegionSize
+            if (mbi.State == MEM_COMMIT and not mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)):
+                off = 0
+                while off < size:
+                    n = min(CHUNK, size - off)
+                    buf = ctypes.create_string_buffer(n)
+                    got = ctypes.c_size_t(0)
+                    if k32.ReadProcessMemory(h, ctypes.c_void_p(base + off), buf, n, ctypes.byref(got)) and got.value:
+                        data = buf.raw[:got.value]
+                        for m in pattern.finditer(data):
+                            key = printable(m.group(0)).lower()
+                            entry = hits.setdefault(key, [0, set()])
+                            entry[0] += 1
+                            if len(entry[1]) < 4:
+                                entry[1].add(printable(data[max(0, m.start() - 40): m.end() + 60]))
+                    off += n
+            addr = base + size
+            if addr >= 0x7FFFFFFFFFFF:
+                break
+    finally:
+        k32.CloseHandle(h)
+    for kw, (count, samples) in hits.items():
+        add("HIGH", "MEMORY STRING", f"{name} (PID {pid}) '{kw}' x{count}")
+        for s in samples:
+            print(f"        ...{s}...")
+
+def scan_memory(all_procs, include_weak):
+    print("\n=== Process memory strings ===")
+    pattern = build_mem_patterns(include_weak)
+    me = os.getpid()
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            pid, name = p.info["pid"], p.info["name"] or "?"
+            if pid in (me, 0, 4):
+                continue
+            if all_procs or "roblox" in name.lower():
+                print(f"  scanning {name} ({pid}) ...")
+                scan_process_memory(pid, name, pattern)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+# --------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--all-procs", action="store_true", help="scan memory of all processes")
+    ap.add_argument("--deep", action="store_true", help="walk every drive")
+    ap.add_argument("--weak-mem", action="store_true", help="include noisy words in memory scan")
+    args = ap.parse_args()
+
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        print("WARNING: not running as Administrator. Prefetch, BAM and memory scans will be incomplete.\n")
+
+    scan_processes()
+    scan_files(args.deep)
+    scan_registry()
+    scan_memory(args.all_procs, args.weak_mem)
+
+    out = f"pc_check_report_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt"
+    with open(out, "w", encoding="utf-8") as f:
+        for sev, cat, detail in sorted(findings, key=lambda x: x[0]):
+            f.write(f"[{sev}] {cat}: {detail}\n")
+    high = sum(1 for f in findings if f[0] == "HIGH")
+    print(f"\nDone. {high} high-confidence and {len(findings) - high} low-confidence findings. Report: {out}")
+
+if __name__ == "__main__":
+    main()
